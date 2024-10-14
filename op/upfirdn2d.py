@@ -3,17 +3,10 @@ import os
 import torch
 from torch.nn import functional as F
 from torch.autograd import Function
-from torch.utils.cpp_extension import load
-
+from .fused_act import _load
 
 module_path = os.path.dirname(__file__)
-upfirdn2d_op = load(
-    "upfirdn2d",
-    sources=[
-        os.path.join(module_path, "upfirdn2d.cpp"),
-        os.path.join(module_path, "upfirdn2d_kernel.cu"),
-    ],
-)
+upfirdn2d_op = _load("upfirdn2d", sources=["upfirdn2d.cpp", "upfirdn2d_kernel.cu"])
 
 
 class UpFirDn2dBackward(Function):
