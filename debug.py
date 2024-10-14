@@ -4,7 +4,7 @@ import io
 import csv
 import numpy as np
 import pandas as pd
-import seaborn as sns
+# import seaborn as sns
 import matplotlib
 import importlib
 import os
@@ -16,12 +16,12 @@ import torch.nn as nn
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
-import tensorflow_gan as tfgan
+# import tensorflow_gan as tfgan
 import tqdm
 import io
 import inspect
-sns.set(font_scale=2)
-sns.set(style="whitegrid")
+# sns.set(font_scale=2)
+# sns.set(style="whitegrid")
 
 import models
 from models import utils as mutils
