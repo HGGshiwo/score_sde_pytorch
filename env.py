@@ -5,6 +5,7 @@ import torch.nn as nn
 from sde_lib import SDE
 from torchrl.envs import EnvBase
 from torchrl.data import BoundedTensorSpec, CompositeSpec, UnboundedContinuousTensorSpec
+from torchrl.envs.utils import step_mdp 
 
 from tensordict import TensorDict, TensorDictBase
 import torch
@@ -31,6 +32,14 @@ def max(input: torch.tensor, *others):
     return input
 
 class Env(EnvBase):
+    """
+    Env for solving the reverse-time SDE.
+
+    Args:
+        use_opt: If `True`, use the optimal step size computed by the ODE solver.
+        compute_opt: If `True`, add opt_action key to the state
+    """
+    
     _A: torch.Tensor = NotImplemented
     _B: torch.Tensor = NotImplemented
     _C: torch.Tensor = NotImplemented
@@ -54,13 +63,6 @@ class Env(EnvBase):
         rtol: float=1e-5,
         atol: float=1e-5,
     ):
-        """
-        Env for solving the reverse-time SDE.
-
-        Args:
-            use_opt: If `True`, use the optimal step size computed by the ODE solver.
-            compute_opt: If `True`, add opt_action key to the state
-        """
         super().__init__(batch_size=(env_num, ), allow_done_after_reset=True, device=device)
         self._sde = sde
         self._eps = eps
@@ -79,6 +81,8 @@ class Env(EnvBase):
         self._atol = atol
         self._compute_opt = compute_opt
         self._use_opt = use_opt
+        
+        self.nfev = torch.zeros(env_num, device=device)
 
         self._n = 3 * 32 * 32  + 1
         
@@ -93,9 +97,11 @@ class Env(EnvBase):
             f=UnboundedContinuousTensorSpec(shape=(env_num, self._n)),
             shape=(env_num,)
         )
+
         if compute_opt or use_opt:
             self.state_spec.update({
-                "h_abs": UnboundedContinuousTensorSpec(shape=(env_num,))
+                "h_abs": UnboundedContinuousTensorSpec(shape=(env_num,)),
+                "step_rejected": BoundedTensorSpec(low=False, high=True, shape=(env_num,)),
             })
             self._error_exponent = -1 / (self._error_estimator_order + 1)
         if compute_opt:
@@ -115,11 +121,15 @@ class Env(EnvBase):
         p = self._sde.prior_logp(z).to(self.device)
         t = torch.ones(self.batch_size, device=self.device) * self._sde.T
         
+        self.nfev = torch.where(done, 0, self.nfev)
+
         epsilon = torch.randn_like(z) 
         ode_func = self._get_ode_func(epsilon)
         f = ode_func(t, torch.concat([z.flatten(1), p[:, None]], dim=-1))
         
-        h_abs = self._select_initial_step(z, p, f, epsilon) \
+        h_abs = self._select_initial_step(ode_func, z, p, f) \
+            if self._compute_opt or self._use_opt else None
+        step_rejected = torch.zeros(self.batch_size, dtype=torch.bool, device=self.device) \
             if self._compute_opt or self._use_opt else None
 
         opt_action = h_abs.clone() if self._compute_opt else None
@@ -130,16 +140,19 @@ class Env(EnvBase):
             epsilon=torch.where(done, epsilon, tensordict["epsilon"])
             t = torch.where(done, t, tensordict["t"])
             f = torch.where(done[:, None], f, tensordict["f"])
+
             if h_abs is not None:
-                h_abs = torch.where(done, h_abs, tensordict["h_abs"])        
+                h_abs = torch.where(done, h_abs, tensordict["h_abs"])
+                step_rejected = torch.where(done, step_rejected, tensordict["step_rejected"])        
         
-        done = torch.where(done, False, True)
-        return self._create_tensordict(z=z, p=p, t=t, done=done, \
-                                       epsilon=epsilon, f=f, h_abs=h_abs, opt_action=opt_action)
+        if not self._use_opt:
+            done = torch.where(done, False, True)
+        return self._create_td(z=z, p=p, t=t, done=done, epsilon=epsilon, \
+                               f=f, h_abs=h_abs, opt_action=opt_action, step_rejected=step_rejected)
     
     def _rk_step(self, ode_func, t, y, f, h)-> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """see https://github.com/scipy/scipy/blob/v1.14.1/scipy/integrate/_ivp/rk.py#L14"""
-        k = torch.zeros((*self.batch_size, self._n_stages + 1, self._n), dtype=y.dtype, device=y.device)
+        k = torch.zeros((t.shape[0], self._n_stages + 1, self._n), dtype=y.dtype, device=y.device)
         k[:, 0] = f
         for s, (a, c) in enumerate(zip(self._A[1:], self._C[1:]), start=1):
             dy = torch.matmul(k[:, :s].permute(0, 2, 1), a[:s]) * h[:, None]
@@ -156,6 +169,7 @@ class Env(EnvBase):
     def _get_ode_func(self, epsilon):
         def drift_fn(x, t):
             """The drift function of the reverse-time SDE."""
+            print(x.mean().item(), t.mean().item())
             score_fn = mutils.get_score_fn(self._sde, self._model, train=False, continuous=True)
             # Probability flow ODE is a special case of Reverse SDE
             rsde = self._sde.reverse(score_fn, probability_flow=True)
@@ -171,6 +185,7 @@ class Env(EnvBase):
             return torch.sum(grad_fn_eps * eps, dim=tuple(range(1, len(x.shape))))
         
         def ode_func(t, zp):
+            self.nfev += 1
             z = zp[:, :-1].reshape(epsilon.shape)
             drift = drift_fn(z, t)
             logp_grad = div_fn(z, t, epsilon)
@@ -184,7 +199,12 @@ class Env(EnvBase):
     def _step(self, tensordict):
         
         if self._use_opt:
-            return self._opt_step(tensordict)
+            _tensordict = tensordict.clone()
+            _tensordict["reward"] = torch.zeros(tensordict.batch_size, device=self.device)
+            tensordict = tensordict[~tensordict["done"]]
+            out = self._opt_step(tensordict)
+            _tensordict[~_tensordict["done"]] = out
+            return _tensordict
         
         if self._compute_opt:
             opt_td = self._opt_step(tensordict.clone())    
@@ -210,14 +230,24 @@ class Env(EnvBase):
         h_abs = opt_td["h_abs"] if self._compute_opt or self._use_opt else None 
         opt_action = opt_td["opt_action"] if self._compute_opt else None
         
-        return self._create_tensordict(
+        return self._create_td(
             done=done, z=z, p=p, t=t, f=f_new, reward=reward, \
                 epsilon=tensordict["epsilon"], h_abs=h_abs, opt_action=opt_action)
          
-    def _create_tensordict(self, **kwargs):
-        return TensorDict({k: v for k, v in kwargs.items() if v is not None}, self.batch_size)
+    def _create_td(self, **kwargs):
+        batch_size = None
+        out = {}
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            if batch_size is None:
+                batch_size = v.shape[0]
+            assert v.shape[0] == batch_size, f"expect {k} to have batch size {batch_size}, got {v.shape[0]}"
+            out[k] = v
 
-    def _select_initial_step(self, z, p, f0, epsilon):
+        return TensorDict(out, batch_size=batch_size)
+
+    def _select_initial_step(self, ode_func, z, p, f0):
         y0 = torch.concat([z.flatten(1), p[:, None]], dim=-1)
         scale = self._atol + torch.abs(y0) * self._rtol
         interval_length = abs(self._sde.T - self._eps)
@@ -229,7 +259,6 @@ class Env(EnvBase):
         # Check t0+h0*direction doesn't take us beyond t_bound
         h0 = min(h0, interval_length)
         y1 = y0 + h0[:, None] * self._direction * f0
-        ode_func = self._get_ode_func(epsilon)
         f1 = ode_func(self._sde.T + h0 * self._direction, y1)
         d2 = norm((f1 - f0) / scale) / h0
 
@@ -249,67 +278,70 @@ class Env(EnvBase):
         t = tensordict["t"]
         f = tensordict["f"]
         h_abs = tensordict["h_abs"]
+        step_rejected = tensordict["step_rejected"]
+        epsilon = tensordict["epsilon"]
 
         min_step = 10 * torch.abs(torch.nextafter(t, self._direction * torch.ones_like(t)) - t)
         h_abs = torch.clip(h_abs, min_step, max_step * torch.ones_like(h_abs))
-        
-        step_accepted = torch.zeros(self.batch_size, dtype=bool, device=self.device)
-        step_rejected = torch.zeros(self.batch_size, dtype=bool, device=self.device)
-        
-        ode_func = self._get_ode_func(tensordict["epsilon"])
+        h_abs = torch.where(~step_rejected, h_abs, tensordict["h_abs"])
+       
+        ode_func = self._get_ode_func(epsilon)
         y = torch.concat([tensordict["z"].flatten(1), tensordict["p"][:, None]], dim=-1)
-        
-        while not step_accepted.all():
             
-            h = h_abs * self._direction
-            t_new = t + h
-            t_new = torch.where(
-                self._direction * (t_new - self._eps) > 0,
-                self._eps,
-                t_new
-            )
+        h = h_abs * self._direction
+        t_new = t + h
+        t_new = torch.where(
+            self._direction * (t_new - self._eps) > 0,
+            self._eps,
+            t_new
+        )
 
-            h = t_new - t
-            y_new, f_new, error = self._rk_step(ode_func, t, y, f, h)
-            scale = atol + min(y.abs(), y_new.abs()) * rtol
-            error_norm = norm(error / scale)
+        h = t_new - t
+        y_new, f_new, error = self._rk_step(ode_func, t, y, f, h)
+        scale = atol + min(y.abs(), y_new.abs()) * rtol
+        error_norm = norm((error / scale))
+        step_accepted = error_norm < 1
+
+        factor = torch.ones_like(error_norm) * MAX_FACTOR
+        factor = torch.where(
+            step_accepted & (error_norm != 0), 
+            min(SAFETY * error_norm ** self._error_exponent, MAX_FACTOR),
+            factor
+        )
+        factor = torch.where(
+            step_accepted & step_rejected,
+            min(factor, 1),
+            factor
+        )
+        factor = torch.where(
+            ~step_accepted,
+            max(SAFETY * error_norm ** self._error_exponent, MIN_FACTOR),
+            factor
+        )
             
-            _step_accepted = (~step_accepted) & (error_norm < 1)
-            _step_rejected = (~step_accepted) & (error_norm >= 1)
-            
-            factor = torch.ones_like(error_norm) * MAX_FACTOR
-            factor = torch.where(
-                _step_accepted & (error_norm != 0), 
-                min(SAFETY * error_norm ** self._error_exponent, MAX_FACTOR),
-                factor
-            )
-            factor = torch.where(
-                _step_accepted & step_rejected,
-                min(factor, 1),
-                factor
-            )
-            factor = torch.where(
-                _step_rejected,
-                max(SAFETY * error_norm ** self._error_exponent, MIN_FACTOR),
-                factor
-            )
-            
-            t = torch.where(_step_accepted, t_new, t)
-            y = torch.where(_step_accepted[:, None], y_new, y)
-            f = torch.where(_step_accepted[:, None], f_new, f)
-            
-            h_abs = torch.where(~step_accepted, h.abs() * factor, h_abs) 
-            print(_step_accepted.sum().item())
-            step_rejected = step_rejected | _step_rejected
-            step_accepted = step_accepted | _step_accepted
+        t = torch.where(step_accepted, t_new, t)
+        y = torch.where(step_accepted[:, None], y_new, y)
+        f = torch.where(step_accepted[:, None], f_new, f)
+        
+        h_abs = h.abs() * factor 
+        step_rejected = ~step_accepted
 
         done = self._compute_done(t)
         z = y[:, :-1].reshape(tensordict["z"].shape)
         p = y[:, -1]
-        reward = -(tensordict["action"] - t).sqrt()
+        reward = -(tensordict["action"] - t).square()
 
-        return self._create_tensordict(done=done, z=z, p=p, t=t, f=f, reward=reward, \
-                                       epsilon=tensordict["epsilon"], h_abs=h_abs)
+        return self._create_td(done=done, z=z, p=p, t=t, f=f, reward=reward, \
+                               epsilon=epsilon, h_abs=h_abs, step_rejected=step_rejected)
+
+    def sample(self):
+        td = self.reset()
+        while not td["done"].all():
+            td["action"] = torch.randn_like(td["h_abs"])
+            td = self.step(td)
+            td = step_mdp(td)
+            print(f"nfev: {self.nfev.mean().item()}, done: {td["done"].sum().item()}")
+        return td["z"]
 
 class RK45Env(Env):
     _C = torch.tensor([0, 1/5, 3/10, 4/5, 8/9, 1])
@@ -354,6 +386,8 @@ if __name__ == "__main__":
     config = configs.get_config()  
     sde = VESDE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max, N=config.model.num_scales)
     score_model = mutils.create_model(config)
+    state_dict = torch.load(ckpt_filename, map_location="cuda")
+    score_model.load_state_dict(state_dict["model"], strict=False)
 
     env = RK45Env(
         sde=sde, 
@@ -367,4 +401,11 @@ if __name__ == "__main__":
     def callback(env, td):
         print(td["h_abs"].mean().item(), td["done"].sum().item())
 
-    rollout = env.rollout(10, break_when_any_done=True, callback=callback)
+    # rollout = env.rollout(10, break_when_any_done=False, callback=callback)
+    td = env.reset()
+    while not td["done"].all():
+        td["action"] = torch.zeros_like(td["h_abs"])
+        td = env.step(td)
+        print(env.nfev.mean().item(), td["done"].sum().item())
+    samples = td["z"]
+    # show_samples(samples)
