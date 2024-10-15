@@ -17,8 +17,8 @@ MIN_FACTOR = 0.2  # Minimum allowed decrease in a step size.
 MAX_FACTOR = 10  # Maximum allowed increase in a step size.
 
 def norm(x: torch.Tensor):
-    dim = tuple(range(1, x.dim()))
-    return torch.norm(x, dim=dim) / np.prod(x.shape[1:]) ** 0.5
+    assert x.dim() == 2, "x must be 2D tensor"
+    return torch.linalg.norm(x, dim=-1) / x.shape[1] ** 0.5
 
 def min(input: torch.tensor, *others):
     for other in others:
@@ -50,8 +50,7 @@ class Env(EnvBase):
         device: torch.device='cpu',
         compute_opt: bool=True,
         use_opt: bool=False,
-        max_step: float=1e-2,
-        min_step: float=1e-5,
+        max_step: float=np.inf,
         rtol: float=1e-5,
         atol: float=1e-5,
     ):
@@ -68,7 +67,7 @@ class Env(EnvBase):
         self._model = model.eval()
         self._model.requires_grad_(False)
         self._error_tol = error_tol
-        self._direction = np.sign(self._sde.T - self._eps) if self._sde.T != self._eps else 1
+        self._direction = np.sign(self._eps - self._sde.T) if self._sde.T != self._eps else 1
         self._A = self._A.to(device)
         self._B = self._B.to(device)
         self._C = self._C.to(device)
@@ -76,7 +75,6 @@ class Env(EnvBase):
         self._P = self._P.to(device)
         
         self._max_step = max_step
-        self._min_step = min_step
         self._rtol = rtol
         self._atol = atol
         self._compute_opt = compute_opt
@@ -88,7 +86,7 @@ class Env(EnvBase):
         self.done_spec = BoundedTensorSpec(low=False, high=True, shape=(env_num,))
         
         self.state_spec = CompositeSpec(
-            z=UnboundedContinuousTensorSpec(shape=(env_num, 3, 32, 32) ),
+            z=UnboundedContinuousTensorSpec(shape=(env_num, 3, 32, 32)),
             p=UnboundedContinuousTensorSpec(shape=(env_num,)),
             epsilon=UnboundedContinuousTensorSpec(shape=(env_num, 3, 32, 32)),
             t=UnboundedContinuousTensorSpec(shape=(env_num,)),
@@ -115,7 +113,7 @@ class Env(EnvBase):
         
         z = self._sde.prior_sampling((*self.batch_size, 3, 32, 32)).to(self.device)       
         p = self._sde.prior_logp(z).to(self.device)
-        t = torch.ones(self.batch_size, device=self.device) * self._eps
+        t = torch.ones(self.batch_size, device=self.device) * self._sde.T
         
         epsilon = torch.randn_like(z) 
         ode_func = self._get_ode_func(epsilon)
@@ -181,7 +179,7 @@ class Env(EnvBase):
         return ode_func
     
     def _compute_done(self, t):
-        return self._direction * (t - self._sde.T) >= 0
+        return self._direction * (t - self._eps) >= 0
 
     def _step(self, tensordict):
         
@@ -256,54 +254,61 @@ class Env(EnvBase):
         h_abs = torch.clip(h_abs, min_step, max_step * torch.ones_like(h_abs))
         
         step_accepted = torch.zeros(self.batch_size, dtype=bool, device=self.device)
-
+        step_rejected = torch.zeros(self.batch_size, dtype=bool, device=self.device)
+        
         ode_func = self._get_ode_func(tensordict["epsilon"])
         y = torch.concat([tensordict["z"].flatten(1), tensordict["p"][:, None]], dim=-1)
         
-        while not step_accepted.any():
+        while not step_accepted.all():
             
             h = h_abs * self._direction
             t_new = t + h
             t_new = torch.where(
-                self._direction * (t_new - self._sde.T) > 0,
-                self._sde.T,
+                self._direction * (t_new - self._eps) > 0,
+                self._eps,
                 t_new
             )
 
             h = t_new - t
-            _h_abs = h.abs()
-
             y_new, f_new, error = self._rk_step(ode_func, t, y, f, h)
             scale = atol + min(y.abs(), y_new.abs()) * rtol
             error_norm = norm(error / scale)
             
-            # new step accepted
-            _step_accepted = ~step_accepted & (error_norm < 1)
-            factor = torch.where(
-                error_norm == 0, 
-                MAX_FACTOR, 
-                min(error_norm, MAX_FACTOR, SAFETY * error_norm ** self._error_exponent)
-            )
-            factor = torch.where(
-                _step_accepted, 
-                min(factor, 1), 
-                max(SAFETY * error_norm ** self._error_exponent, MIN_FACTOR)
-            )
-            _h_abs = torch.where(~step_accepted, _h_abs * factor, _h_abs)
+            _step_accepted = (~step_accepted) & (error_norm < 1)
+            _step_rejected = (~step_accepted) & (error_norm >= 1)
             
-            new_accepted = ~step_accepted & _step_accepted
-            h_abs = torch.where(new_accepted, _h_abs, h_abs)
-            t = torch.where(new_accepted, t_new, t)
-            y = torch.where(new_accepted[:, None], y_new, y)
-            f = torch.where(new_accepted[:, None], f_new, f)
+            factor = torch.ones_like(error_norm) * MAX_FACTOR
+            factor = torch.where(
+                _step_accepted & (error_norm != 0), 
+                min(SAFETY * error_norm ** self._error_exponent, MAX_FACTOR),
+                factor
+            )
+            factor = torch.where(
+                _step_accepted & step_rejected,
+                min(factor, 1),
+                factor
+            )
+            factor = torch.where(
+                _step_rejected,
+                max(SAFETY * error_norm ** self._error_exponent, MIN_FACTOR),
+                factor
+            )
+            
+            t = torch.where(_step_accepted, t_new, t)
+            y = torch.where(_step_accepted[:, None], y_new, y)
+            f = torch.where(_step_accepted[:, None], f_new, f)
+            
+            h_abs = torch.where(~step_accepted, h.abs() * factor, h_abs) 
+            print(_step_accepted.sum().item())
+            step_rejected = step_rejected | _step_rejected
             step_accepted = step_accepted | _step_accepted
-            
+
         done = self._compute_done(t)
         z = y[:, :-1].reshape(tensordict["z"].shape)
         p = y[:, -1]
         reward = -(tensordict["action"] - t).sqrt()
 
-        return self._create_tensordict(done=done, z=z, p=p, t=t, f=f_new, reward=reward, \
+        return self._create_tensordict(done=done, z=z, p=p, t=t, f=f, reward=reward, \
                                        epsilon=tensordict["epsilon"], h_abs=h_abs)
 
 class RK45Env(Env):
@@ -336,15 +341,20 @@ class RK45Env(Env):
     _error_estimator_order = 4
 
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
     from configs.ve import cifar10_ncsnpp_continuous as configs
     from sde_lib import VESDE
     from models import ncsnpp
-    
+    from env import RK45Env
+    import models.utils as mutils
+    import torch
+    import numpy as np
+
     ckpt_filename = "exp/ve/cifar10_ncsnpp_continuous/checkpoint_24.pth"
     config = configs.get_config()  
     sde = VESDE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max, N=config.model.num_scales)
     score_model = mutils.create_model(config)
-    
+
     env = RK45Env(
         sde=sde, 
         model=score_model, 
@@ -353,5 +363,8 @@ if __name__ == "__main__":
         use_opt=True, 
         compute_opt=False
     )
-    rollout = env.rollout(1, break_when_any_done=False)
-    print(rollout)
+
+    def callback(env, td):
+        print(td["h_abs"].mean().item(), td["done"].sum().item())
+
+    rollout = env.rollout(10, break_when_any_done=True, callback=callback)
