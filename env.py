@@ -190,7 +190,6 @@ class Env(EnvBase):
     def _get_ode_func(self, epsilon):
         def drift_fn(x, t):
             """The drift function of the reverse-time SDE."""
-            print(x.mean().item(), t.mean().item())
             score_fn = mutils.get_score_fn(self._sde, self._model, train=False, continuous=True)
             # Probability flow ODE is a special case of Reverse SDE
             rsde = self._sde.reverse(score_fn, probability_flow=True)
@@ -318,7 +317,7 @@ class Env(EnvBase):
 
         h = t_new - t
         y_new, f_new, error = self._rk_step(ode_func, t, y, f, h)
-        scale = atol + min(y.abs(), y_new.abs()) * rtol
+        scale = atol + max(y.abs(), y_new.abs()) * rtol
         error_norm = norm((error / scale))
         step_accepted = error_norm < 1
 
@@ -353,13 +352,17 @@ class Env(EnvBase):
         return self._create_td(done=done, z=z, p=p, t=t, f=f, reward=reward, \
                                epsilon=epsilon, h_abs=h_abs, step_rejected=step_rejected)
 
-    def sample(self):
+    def sample(self, callback=None):
+        self.nfev = torch.zeros(self.batch_size, device=self.device)
         td = self.reset()
+        i = 0
         while not td["done"].all():
             td["action"] = torch.randn_like(td["h_abs"])
+            i += 1
             td = self.step(td)
             td = step_mdp(td)
-            print(f"nfev: {self.nfev.mean().item()}, done: {td["done"].sum().item()}")
+            if callback is not None:
+                callback(self, td)
         return td["z"]
 
 class RK45Env(Env):
@@ -400,6 +403,7 @@ if __name__ == "__main__":
     import models.utils as mutils
     import torch
     import numpy as np
+    from models.ema import ExponentialMovingAverage
 
     ckpt_filename = "exp/ve/cifar10_ncsnpp_continuous/checkpoint_24.pth"
     config = configs.get_config()  
@@ -407,24 +411,40 @@ if __name__ == "__main__":
     score_model = mutils.create_model(config)
     state_dict = torch.load(ckpt_filename, map_location="cuda")
     score_model.load_state_dict(state_dict["model"], strict=False)
+    ema = ExponentialMovingAverage(score_model.parameters(),
+                               decay=config.model.ema_rate)
+    ema.load_state_dict(state_dict["ema"])
+    ema.copy_to(score_model.parameters())
+    # env = RK45Env(
+    #     sde=sde, 
+    #     model=score_model, 
+    #     env_num=32, 
+    #     device=torch.device("cuda"), 
+    #     use_opt=True, 
+    #     compute_opt=False
+    # )
 
-    env = RK45Env(
-        sde=sde, 
-        model=score_model, 
-        env_num=32, 
-        device=torch.device("cuda"), 
-        use_opt=True, 
-        compute_opt=False
-    )
+    # def callback(env, td):
+    #     print(td["h_abs"].mean().item(), td["done"].sum().item())
 
-    def callback(env, td):
-        print(td["h_abs"].mean().item(), td["done"].sum().item())
-
-    # rollout = env.rollout(10, break_when_any_done=False, callback=callback)
-    td = env.reset()
-    while not td["done"].all():
-        td["action"] = torch.zeros_like(td["h_abs"])
-        td = env.step(td)
-        print(env.nfev.mean().item(), td["done"].sum().item())
-    samples = td["z"]
+    # # rollout = env.rollout(10, break_when_any_done=False, callback=callback)
+    # td = env.reset()
+    # while not td["done"].all():
+    #     td["action"] = torch.zeros_like(td["h_abs"])
+    #     td = env.step(td)
+    #     print(env.nfev.mean().item(), td["done"].sum().item())
+    # samples = td["z"]
     # show_samples(samples)
+    
+    import sampling
+    import datasets
+    shape = (1, 3, 32, 32)
+    inverse_scaler = datasets.get_data_inverse_scaler(config)
+    sampling_eps = 1e-5
+    sampling_fn = sampling.get_ode_sampler(sde,                                        
+                                       shape, 
+                                       inverse_scaler,                                       
+                                       denoise=True, 
+                                       eps=sampling_eps,
+                                       device=config.device)
+    x, nfe = sampling_fn(score_model)
