@@ -59,6 +59,7 @@ class Env(EnvBase):
         device: torch.device='cpu',
         compute_opt: bool=True,
         use_opt: bool=False,
+        compute_logp: bool=False,
         max_step: float=np.inf,
         rtol: float=1e-5,
         atol: float=1e-5,
@@ -80,23 +81,29 @@ class Env(EnvBase):
         self._rtol = rtol
         self._atol = atol
         self._compute_opt = compute_opt
+        self._compute_logp = compute_logp
         self._use_opt = use_opt
         
         self.nfev = torch.zeros(env_num, device=device)
 
-        self._n = 3 * 32 * 32  + 1
+        p_dim = 1 if compute_logp else 0
+        self._n = 3 * 32 * 32  + p_dim
         
         self.action_spec = BoundedTensorSpec(low=self._eps, high=self._sde.T, shape=(env_num,))
         self.done_spec = BoundedTensorSpec(low=False, high=True, shape=(env_num,))
         
         self.state_spec = CompositeSpec(
             z=UnboundedContinuousTensorSpec(shape=(env_num, 3, 32, 32)),
-            p=UnboundedContinuousTensorSpec(shape=(env_num,)),
             epsilon=UnboundedContinuousTensorSpec(shape=(env_num, 3, 32, 32)),
             t=UnboundedContinuousTensorSpec(shape=(env_num,)),
             f=UnboundedContinuousTensorSpec(shape=(env_num, self._n)),
             shape=(env_num,)
         )
+
+        if compute_logp:
+            self.state_spec.update({
+                "p": UnboundedContinuousTensorSpec(shape=(env_num,))
+            })
 
         if compute_opt or use_opt:
             self.state_spec.update({
@@ -109,6 +116,19 @@ class Env(EnvBase):
 
         self.observation_spec = self.state_spec.clone()
     
+    def _split_zp(self, zp):
+        if self._compute_logp:
+            z = zp[:, :-1].reshape((-1, 3, 32, 32))
+            p = zp[:, -1]
+            return z, p
+        return zp.reshape((-1, 3, 32, 32)), None
+    
+    def _merge_zp(self, z, p=None):
+        if self._compute_logp:
+            return torch.concat([z.flatten(1), p[:, None]], dim=-1)
+        return z.flatten(1)
+
+
     def _set_seed(self, seed: Optional[int]):
         self.rng = torch.manual_seed(seed)
 
@@ -117,15 +137,15 @@ class Env(EnvBase):
         done = torch.zeros(self.batch_size, dtype=torch.bool, device=self.device) \
             if tensordict is None else tensordict["done"]
         
-        z = self._sde.prior_sampling((*self.batch_size, 3, 32, 32)).to(self.device)       
-        p = self._sde.prior_logp(z).to(self.device)
+        z = self._sde.prior_sampling((*self.batch_size, 3, 32, 32)).to(self.device)    
+        p = self._sde.prior_logp(z).to(self.device) if self._compute_logp else None
         t = torch.ones(self.batch_size, device=self.device) * self._sde.T
         
         self.nfev = torch.where(done, 0, self.nfev)
 
         epsilon = torch.randn_like(z) 
         ode_func = self._get_ode_func(epsilon)
-        f = ode_func(t, torch.concat([z.flatten(1), p[:, None]], dim=-1))
+        f = ode_func(t, self._merge_zp(z, p))
         
         h_abs = self._select_initial_step(ode_func, z, p, f) \
             if self._compute_opt or self._use_opt else None
@@ -136,7 +156,8 @@ class Env(EnvBase):
 
         if tensordict is not None:
             z = torch.where(done, z, tensordict["z"])
-            p = torch.where(done, p, tensordict["p"])
+            if self._compute_logp:
+                p = torch.where(done, p, tensordict["p"])
             epsilon=torch.where(done, epsilon, tensordict["epsilon"])
             t = torch.where(done, t, tensordict["t"])
             f = torch.where(done[:, None], f, tensordict["f"])
@@ -186,10 +207,10 @@ class Env(EnvBase):
         
         def ode_func(t, zp):
             self.nfev += 1
-            z = zp[:, :-1].reshape(epsilon.shape)
+            z, _ = self._split_zp(zp)
             drift = drift_fn(z, t)
-            logp_grad = div_fn(z, t, epsilon)
-            return torch.concat([drift.flatten(1), logp_grad[:, None]], axis=-1)
+            logp_grad = div_fn(z, t, epsilon) if self._compute_logp else None
+            return self._merge_zp(drift, logp_grad)
                 
         return ode_func
     
@@ -214,12 +235,11 @@ class Env(EnvBase):
         h = t - tensordict["t"]
         
         z = tensordict["z"]
-        p = tensordict["p"]
+        p = tensordict["p"] if self._compute_logp else None
         
         ode_func = self._get_ode_func(tensordict["epsilon"])
-        y_new, f_new, error = self._rk_step(ode_func, t, torch.concat([z.flatten(1), p[:, None]], dim=-1), tensordict["f"], h)
-        z = y_new[:, :-1].reshape(z.shape)
-        p = y_new[:, -1]
+        y_new, f_new, error = self._rk_step(ode_func, t, self._merge_zp(z, p), tensordict["f"], h)
+        z, p = self._split_zp(y_new)
         
         done = self._compute_done(t)
     
@@ -248,7 +268,7 @@ class Env(EnvBase):
         return TensorDict(out, batch_size=batch_size)
 
     def _select_initial_step(self, ode_func, z, p, f0):
-        y0 = torch.concat([z.flatten(1), p[:, None]], dim=-1)
+        y0 = self._merge_zp(z, p)
         scale = self._atol + torch.abs(y0) * self._rtol
         interval_length = abs(self._sde.T - self._eps)
         
@@ -286,7 +306,7 @@ class Env(EnvBase):
         h_abs = torch.where(~step_rejected, h_abs, tensordict["h_abs"])
        
         ode_func = self._get_ode_func(epsilon)
-        y = torch.concat([tensordict["z"].flatten(1), tensordict["p"][:, None]], dim=-1)
+        y = self._merge_zp(tensordict["z"], tensordict.get("p", None))
             
         h = h_abs * self._direction
         t_new = t + h
@@ -327,8 +347,7 @@ class Env(EnvBase):
         step_rejected = ~step_accepted
 
         done = self._compute_done(t)
-        z = y[:, :-1].reshape(tensordict["z"].shape)
-        p = y[:, -1]
+        z, p = self._split_zp(y)
         reward = -(tensordict["action"] - t).square()
 
         return self._create_td(done=done, z=z, p=p, t=t, f=f, reward=reward, \
