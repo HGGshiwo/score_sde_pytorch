@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import numpy as np
 import torch.nn as nn
 
@@ -31,6 +31,30 @@ def max(input: torch.tensor, *others):
         input = input.clip(min=other)
     return input
 
+def enable_dtype(dtype=torch.float64): 
+    target = torch.float64 if dtype == torch.float32 else torch.float32
+    
+    def convert_to_dtype(x, _dtype):
+        if isinstance(x, torch.Tensor) and \
+            ((x.dtype == torch.float32) or (x.dtype == torch.float64)):
+            x = x.to(_dtype)
+        elif isinstance(x, TensorDict) or isinstance(x, dict):
+            for k, v in x.items():
+                x[k] = convert_to_dtype(v, _dtype)
+        elif isinstance(x, tuple):
+            x = tuple(convert_to_dtype(arg, _dtype) for arg in x)
+        return x
+    
+    def outter(func):
+        def wrapper(*args, **kwargs):        
+            _args = [convert_to_dtype(arg, dtype) for arg in args]
+            _kwargs = {k: convert_to_dtype(v, dtype) for k, v in kwargs.items()}
+            out = func(*_args, **_kwargs)
+            return convert_to_dtype(out, target)
+        return wrapper
+    
+    return outter
+
 class Env(EnvBase):
     """
     Env for solving the reverse-time SDE.
@@ -40,11 +64,11 @@ class Env(EnvBase):
         compute_opt: If `True`, add opt_action key to the state
     """
     
-    _A: torch.Tensor = NotImplemented
-    _B: torch.Tensor = NotImplemented
-    _C: torch.Tensor = NotImplemented
-    _E: torch.Tensor = NotImplemented
-    _P: torch.Tensor = NotImplemented
+    _A: List = NotImplemented
+    _B: List = NotImplemented
+    _C: List = NotImplemented
+    _E: List = NotImplemented
+    _P: List = NotImplemented
     _n_stages: int = NotImplemented
     _error_estimator_order: int = NotImplemented
     
@@ -71,11 +95,11 @@ class Env(EnvBase):
         self._model.requires_grad_(False)
         self._error_tol = error_tol
         self._direction = np.sign(self._eps - self._sde.T) if self._sde.T != self._eps else 1
-        self._A = self._A.to(device)
-        self._B = self._B.to(device)
-        self._C = self._C.to(device)
-        self._E = self._E.to(device)
-        self._P = self._P.to(device)
+        self._A = torch.tensor(self._A, dtype=torch.float64, device=device)
+        self._B = torch.tensor(self._B, dtype=torch.float64, device=device)
+        self._C = torch.tensor(self._C, dtype=torch.float64, device=device)
+        self._E = torch.tensor(self._E, dtype=torch.float64, device=device)
+        self._P = torch.tensor(self._P, dtype=torch.float64, device=device)
         
         self._max_step = max_step
         self._rtol = rtol
@@ -191,6 +215,7 @@ class Env(EnvBase):
         def drift_fn(x, t):
             """The drift function of the reverse-time SDE."""
             score_fn = mutils.get_score_fn(self._sde, self._model, train=False, continuous=True)
+            score_fn = enable_dtype(torch.float32)(score_fn)
             # Probability flow ODE is a special case of Reverse SDE
             rsde = self._sde.reverse(score_fn, probability_flow=True)
             return rsde.sde(x, t)[0]
@@ -216,11 +241,12 @@ class Env(EnvBase):
     def _compute_done(self, t):
         return self._direction * (t - self._eps) >= 0
 
+    @enable_dtype()
     def _step(self, tensordict):
         
         if self._use_opt:
             _tensordict = tensordict.clone()
-            _tensordict["reward"] = torch.zeros(tensordict.batch_size, device=self.device)
+            _tensordict["reward"] = torch.zeros(tensordict.batch_size, device=self.device, dtype=torch.float64)
             tensordict = tensordict[~tensordict["done"]]
             out = self._opt_step(tensordict)
             _tensordict[~_tensordict["done"]] = out
@@ -266,6 +292,7 @@ class Env(EnvBase):
 
         return TensorDict(out, batch_size=batch_size)
 
+    @enable_dtype()
     def _select_initial_step(self, ode_func, z, p, f0):
         y0 = self._merge_zp(z, p)
         scale = self._atol + torch.abs(y0) * self._rtol
@@ -366,20 +393,20 @@ class Env(EnvBase):
         return td["z"]
 
 class RK45Env(Env):
-    _C = torch.tensor([0, 1/5, 3/10, 4/5, 8/9, 1])
-    _A = torch.tensor([
+    _C = [0, 1/5, 3/10, 4/5, 8/9, 1]
+    _A = [
         [0, 0, 0, 0, 0],
         [1/5, 0, 0, 0, 0],
         [3/40, 9/40, 0, 0, 0],
         [44/45, -56/15, 32/9, 0, 0],
         [19372/6561, -25360/2187, 64448/6561, -212/729, 0],
         [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656]
-    ])
-    _B = torch.tensor([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84])
-    _E = torch.tensor([-71/57600, 0, 71/16695, -71/1920, 17253/339200, -22/525,
-                  1/40])
+    ]
+    _B = [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84]
+    _E = [-71/57600, 0, 71/16695, -71/1920, 17253/339200, -22/525,
+                  1/40]
     # Corresponds to the optimum value of c_6 from [2]_.
-    _P = torch.tensor([
+    _P = [
         [1, -8048581381/2820520608, 8663915743/2820520608,
          -12715105075/11282082432],
         [0, 0, 0, 0],
@@ -390,7 +417,7 @@ class RK45Env(Env):
         [0, 127303824393/49829197408, -318862633887/49829197408,
          701980252875 / 199316789632],
         [0, -282668133/205662961, 2019193451/616988883, -1453857185/822651844],
-        [0, 40617522/29380423, -110615467/29380423, 69997945/29380423]])
+        [0, 40617522/29380423, -110615467/29380423, 69997945/29380423]]
     _n_stages = 6
     _error_estimator_order = 4
 
@@ -415,15 +442,16 @@ if __name__ == "__main__":
                                decay=config.model.ema_rate)
     ema.load_state_dict(state_dict["ema"])
     ema.copy_to(score_model.parameters())
-    # env = RK45Env(
-    #     sde=sde, 
-    #     model=score_model, 
-    #     env_num=32, 
-    #     device=torch.device("cuda"), 
-    #     use_opt=True, 
-    #     compute_opt=False
-    # )
-
+    env = RK45Env(
+        sde=sde, 
+        model=score_model, 
+        env_num=1, 
+        device=torch.device("cuda"), 
+        use_opt=True, 
+        compute_opt=False
+    )
+    samples = env.sample()
+    exit()
     # def callback(env, td):
     #     print(td["h_abs"].mean().item(), td["done"].sum().item())
 
