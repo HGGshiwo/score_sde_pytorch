@@ -61,7 +61,6 @@ class Env(EnvBase):
 
     Args:
         use_opt: If `True`, use the optimal step size computed by the ODE solver.
-        compute_opt: If `True`, add opt_action key to the state
     """
     
     _A: List = NotImplemented
@@ -81,8 +80,6 @@ class Env(EnvBase):
         env_num: int=1, 
         error_tol: float=1e-6,
         device: torch.device='cpu',
-        compute_opt: bool=True,
-        use_opt: bool=False,
         compute_logp: bool=False,
         max_step: float=np.inf,
         rtol: float=1e-5,
@@ -104,15 +101,13 @@ class Env(EnvBase):
         self._max_step = max_step
         self._rtol = rtol
         self._atol = atol
-        self._compute_opt = compute_opt
         self._compute_logp = compute_logp
-        self._use_opt = use_opt
 
         p_dim = 1 if compute_logp else 0
         self._n = 3 * 32 * 32  + p_dim
         
         self.action_spec = BoundedTensorSpec(low=self._eps, high=self._sde.T, shape=(env_num,))
-        self.done_spec = BoundedTensorSpec(low=False, high=True, shape=(env_num,))
+        self.done_spec = BoundedTensorSpec(low=False, high=True, shape=(env_num,), dtype=torch.bool)
         
         self.state_spec = CompositeSpec(
             z=UnboundedContinuousTensorSpec(shape=(env_num, 3, 32, 32)),
@@ -120,6 +115,9 @@ class Env(EnvBase):
             t=UnboundedContinuousTensorSpec(shape=(env_num,)),
             f=UnboundedContinuousTensorSpec(shape=(env_num, self._n)),
             nfev=UnboundedContinuousTensorSpec(shape=(env_num,)),
+            h_abs=UnboundedContinuousTensorSpec(shape=(env_num,)), # opt_action
+            step_rejected=BoundedTensorSpec(low=False, high=True, shape=(env_num,)),
+            error_norm=UnboundedContinuousTensorSpec(shape=(env_num,)),
             shape=(env_num,)
         )
 
@@ -127,16 +125,7 @@ class Env(EnvBase):
             self.state_spec.update({
                 "p": UnboundedContinuousTensorSpec(shape=(env_num,))
             })
-
-        if compute_opt or use_opt:
-            self.state_spec.update({
-                "h_abs": UnboundedContinuousTensorSpec(shape=(env_num,)),
-                "step_rejected": BoundedTensorSpec(low=False, high=True, shape=(env_num,)),
-            })
-            self._error_exponent = -1 / (self._error_estimator_order + 1)
-        if compute_opt:
-            self.state_spec.update({"opt_action": self.action_spec.clone()})
-
+        self._error_exponent = -1 / (self._error_estimator_order + 1)
         self.observation_spec = self.state_spec.clone()
     
     def _split_zp(self, zp):
@@ -162,20 +151,18 @@ class Env(EnvBase):
             done=torch.zeros(self.batch_size, dtype=torch.bool, device=self.device),
             nfev=torch.zeros(self.batch_size, device=self.device),
             epsilon=torch.randn_like(z),             
-            p=self._sde.prior_logp(z).to(self.device) if self._compute_logp else None
+            p=self._sde.prior_logp(z).to(self.device) if self._compute_logp else None,
+            step_rejected=torch.zeros(self.batch_size, dtype=torch.bool, device=self.device),
+            f=torch.zeros(*self.batch_size, self._n, device=self.device),
+            h_abs=torch.zeros(self.batch_size, device=self.device),
+            error_norm=torch.zeros(self.batch_size, device=self.device),
         )
         done = ~init_td["done"] if td is None else td["done"]
-        new_td = init_td if td is None else td[done]
+        new_td = init_td[done]
          
         ode_func = self._get_ode_func(new_td)
-        new_td["f"] = ode_func(new_td["t"], self._merge_zp(new_td["z"], new_td.get("p", None)))
-        
-        if self._compute_opt or self._use_opt:
-            new_td["h_abs"] = self._select_initial_step(ode_func, new_td["z"], new_td.get("p", None), new_td["f"])
-            new_td["step_rejected"] = torch.zeros(done.sum(), dtype=torch.bool, device=self.device)    
-
-        if self._compute_opt:
-            new_td["opt_action"] = new_td["h_abs"].clone() 
+        new_td["f"] = ode_func(new_td["t"], self._merge_zp(new_td["z"], new_td.get("p", None))).to(torch.float32)
+        new_td["h_abs"] = self._select_initial_step(ode_func, new_td["z"], new_td.get("p", None), new_td["f"])
         
         td = init_td if td is None else td
         td[done] = new_td.clone()
@@ -186,14 +173,14 @@ class Env(EnvBase):
         k = torch.zeros((t.shape[0], self._n_stages + 1, self._n), dtype=y.dtype, device=y.device)
         k[:, 0] = f
         for s, (a, c) in enumerate(zip(self._A[1:], self._C[1:]), start=1):
-            dy = torch.matmul(k[:, :s].permute(0, 2, 1), a[:s]) * h[:, None]
+            dy = torch.matmul(k[:, :s].permute(0, 2, 1).contiguous(), a[:s]) * h[:, None]
             k[:, s] = ode_func(t + c * h, y + dy)
 
-        y_new = y + h[:, None] * torch.matmul(k[:, :-1].permute(0, 2, 1), self._B)
+        y_new = y + h[:, None] * torch.matmul(k[:, :-1].permute(0, 2, 1).contiguous(), self._B)
         f_new = ode_func(t + h, y_new)
 
         k[:, -1] = f_new
-        error = torch.matmul(k.permute(0, 2, 1), self._E) * h[:, None]
+        error = torch.matmul(k.permute(0, 2, 1).contiguous(), self._E) * h[:, None]
         
         return y_new, f_new, error
 
@@ -225,84 +212,17 @@ class Env(EnvBase):
         return ode_func
     
     def _compute_done(self, t):
-        return self._direction * (t - self._eps) >= 0
+        return (self._direction * (t - self._eps) >= 0).to(torch.bool)
 
     @enable_dtype()
     def _step(self, tensordict):
-        
-        if self._use_opt:
+        use_opt =  tensordict.get("action", None) is None
+        if use_opt:
             _tensordict = tensordict.clone()
-            _tensordict["reward"] = torch.zeros(tensordict.batch_size, device=self.device, dtype=torch.float64)
+            # try to avoid creating new tensors when copy
+            _tensordict["reward"] = torch.zeros(_tensordict.batch_size, device=self.device, dtype=torch.float64)
             tensordict = tensordict[~tensordict["done"]]
-            out = self._opt_step(tensordict)
-            _tensordict[~_tensordict["done"]] = out
-            return _tensordict
-        
-        if self._compute_opt:
-            opt_td = self._opt_step(tensordict.clone())    
 
-        h = tensordict["action"] * self._direction
-        t = torch.clip(tensordict["t"] + h, self._eps, self._sde.T)
-        h = t - tensordict["t"]
-        
-        z = tensordict["z"]
-        p = tensordict["p"] if self._compute_logp else None
-        
-        ode_func = self._get_ode_func(tensordict)
-        y_new, f_new, error = self._rk_step(ode_func, t, self._merge_zp(z, p), tensordict["f"], h)
-        z, p = self._split_zp(y_new)
-        
-        done = self._compute_done(t)
-    
-        reward = p.clone()
-        reward += torch.where(done, 100, 0)
-        reward += torch.where(torch.abs(error).sum(dim=-1) < self._error_tol, 1, 0)
-        
-        h_abs = opt_td["h_abs"] if self._compute_opt or self._use_opt else None 
-        opt_action = opt_td["opt_action"] if self._compute_opt else None
-        
-        return self._create_td(
-            done=done, z=z, p=p, t=t, f=f_new, reward=reward, \
-                epsilon=tensordict["epsilon"], h_abs=h_abs, opt_action=opt_action)
-         
-    def _create_td(self, **kwargs):
-        batch_size = None
-        out = {}
-        for k, v in kwargs.items():
-            if v is None:
-                continue
-            if batch_size is None:
-                batch_size = v.shape[0]
-            assert v.shape[0] == batch_size, f"expect {k} to have batch size {batch_size}, got {v.shape[0]}"
-            out[k] = v
-
-        return TensorDict(out, batch_size=batch_size)
-
-    @enable_dtype()
-    def _select_initial_step(self, ode_func, z, p, f0):
-        y0 = self._merge_zp(z, p)
-        scale = self._atol + torch.abs(y0) * self._rtol
-        interval_length = abs(self._sde.T - self._eps)
-        
-        d0 = norm(y0 / scale)
-        d1 = norm(f0 / scale)
-        h0 = torch.where((d0 < 1e-5) | (d1 < 1e-5), 1e-6, 0.01 * d0 / d1)
-
-        # Check t0+h0*direction doesn't take us beyond t_bound
-        h0 = min(h0, interval_length)
-        y1 = y0 + h0[:, None] * self._direction * f0
-        f1 = ode_func(self._sde.T + h0 * self._direction, y1)
-        d2 = norm((f1 - f0) / scale) / h0
-
-        h1 = torch.where(
-            (d1 <= 1e-15) & (d2 <= 1e-15), 
-            max(h0 * 1e-3, 1e-6), 
-            (0.01 / max(d1, d2)) ** (1 / (self._error_estimator_order + 1))
-        )
-        
-        return min(100 * h0, h1, interval_length, self._max_step)
-
-    def _opt_step(self, tensordict):
         """"see https://github.com/scipy/scipy/blob/v1.14.1/scipy/integrate/_ivp/rk.py#L111"""
         max_step = self._max_step
         rtol = self._rtol
@@ -328,7 +248,8 @@ class Env(EnvBase):
         )
 
         h = t_new - t
-        y_new, f_new, error = self._rk_step(ode_func, t, y, f, h)
+        _h = h if use_opt else tensordict["action"].squeeze(-1)
+        y_new, f_new, error = self._rk_step(ode_func, t, y, f, _h)
         scale = atol + max(y.abs(), y_new.abs()) * rtol
         error_norm = norm((error / scale))
         step_accepted = error_norm < 1
@@ -359,16 +280,60 @@ class Env(EnvBase):
 
         done = self._compute_done(t)
         z, p = self._split_zp(y)
-        reward = -(tensordict["action"] - t).square()
+        reward = -error_norm.clone()
 
-        return self._create_td(done=done, z=z, p=p, t=t, f=f, reward=reward, nfev=tensordict["nfev"], \
-                               epsilon=tensordict["epsilon"], h_abs=h_abs, step_rejected=step_rejected)
+        tensordict = self._create_td(done=done, \
+            z=z, p=p, t=t, f=f, reward=reward, nfev=tensordict["nfev"], error_norm=error_norm, \
+                epsilon=tensordict["epsilon"], h_abs=h_abs, step_rejected=step_rejected)
+
+        if use_opt:
+            _tensordict[~_tensordict["done"]] = tensordict
+        else:
+            _tensordict = tensordict
+        
+        return _tensordict
+         
+    def _create_td(self, **kwargs):
+        batch_size = None
+        out = {}
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            if batch_size is None:
+                batch_size = v.shape[0]
+            assert v.shape[0] == batch_size, f"expect {k} to have batch size {batch_size}, got {v.shape[0]}"
+            out[k] = v
+
+        return TensorDict(out, batch_size=batch_size)
+    
+    @enable_dtype()
+    def _select_initial_step(self, ode_func, z, p, f0):
+        y0 = self._merge_zp(z, p)
+        scale = self._atol + torch.abs(y0) * self._rtol
+        interval_length = abs(self._sde.T - self._eps)
+        
+        d0 = norm(y0 / scale)
+        d1 = norm(f0 / scale)
+        h0 = torch.where((d0 < 1e-5) | (d1 < 1e-5), 1e-6, 0.01 * d0 / d1)
+
+        # Check t0+h0*direction doesn't take us beyond t_bound
+        h0 = min(h0, interval_length)
+        y1 = y0 + h0[:, None] * self._direction * f0
+        f1 = ode_func(self._sde.T + h0 * self._direction, y1)
+        d2 = norm((f1 - f0) / scale) / h0
+
+        h1 = torch.where(
+            (d1 <= 1e-15) & (d2 <= 1e-15), 
+            max(h0 * 1e-3, 1e-6), 
+            (0.01 / max(d1, d2)) ** (1 / (self._error_estimator_order + 1))
+        )
+        
+        return min(100 * h0, h1, interval_length, self._max_step)
 
     def sample(self, callback=None):
         td = self.reset()
         i = 0
         while not td["done"].all():
-            td["action"] = torch.randn_like(td["h_abs"])
             i += 1
             td = self.step(td)
             td = step_mdp(td)
@@ -405,6 +370,33 @@ class RK45Env(Env):
     _n_stages = 6
     _error_estimator_order = 4
 
+def create_env(config):
+    from configs.ve import cifar10_ncsnpp_continuous as configs
+    from sde_lib import VESDE
+    from models import ncsnpp
+    from models.ema import ExponentialMovingAverage
+    import models.utils as mutils
+
+    env_num = config.env_num
+    ckpt_filename = "exp/ve/cifar10_ncsnpp_continuous/checkpoint_24.pth"
+    config = configs.get_config()  
+    sde = VESDE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max, N=config.model.num_scales)
+    score_model = mutils.create_model(config)
+    state_dict = torch.load(ckpt_filename, map_location="cuda")
+    score_model.load_state_dict(state_dict["model"], strict=False)
+    ema = ExponentialMovingAverage(score_model.parameters(),
+                               decay=config.model.ema_rate)
+    ema.load_state_dict(state_dict["ema"])
+    ema.copy_to(score_model.parameters())
+    env = RK45Env(
+        env_num=env_num,
+        sde=sde, 
+        model=score_model,  
+        device=torch.device("cuda"), 
+        compute_logp=False,
+    )
+    return env
+
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     from configs.ve import cifar10_ncsnpp_continuous as configs
@@ -429,10 +421,9 @@ if __name__ == "__main__":
     env = RK45Env(
         sde=sde, 
         model=score_model, 
-        env_num=1, 
+        env_num=32, 
         device=torch.device("cuda"), 
-        use_opt=True, 
-        compute_opt=False
+        compute_logp=False,
     )
     samples = env.sample()
     exit()
