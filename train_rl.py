@@ -1,4 +1,4 @@
-from torchrl.trainers import Trainer, ReplayBufferTrainer
+from torchrl.trainers import Trainer, ReplayBufferTrainer,  LogReward
 import torch.nn as nn
 import torch
 from torch.distributions import Normal
@@ -171,6 +171,7 @@ if __name__ == "__main__":
         log_interval=cfg.log_interval,
         save_trainer_file=os.path.join("exp/rl", exp_name, "trainer.pt"),
         save_trainer_interval=cfg.save_interval,
+        clip_norm=1.0,
     )
 
     if os.path.exists(trainer.save_trainer_file):
@@ -180,6 +181,10 @@ if __name__ == "__main__":
     trainer.register_op("batch_process", rb_trainer.extend)
     trainer.register_op("process_optim_batch", rb_trainer.sample)
     trainer.register_op("post_loss", rb_trainer.update_priority)
+    
+    log_reward = LogReward(reward_key=("next", "reward"))
+    trainer.register_op("pre_steps_log", log_reward)
+    
     try:
         trainer.train() 
     except KeyboardInterrupt:
